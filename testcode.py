@@ -2,11 +2,13 @@
 """
 Quantitative Mean-Reversion Backtesting Pipeline
 Target Asset: BTC/USD 5-minute High-Frequency Data
-Mathematical Models: Ornstein-Uhlenbeck Half-Life, Kalman Filter, EWMA Volatility
+Mathematical Models: Ornstein-Uhlenbeck Half-Life, Kalman Filter, EWMA Volatility, ATR(14)
 """
 
+import math
+import sys
 import warnings
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -22,10 +24,9 @@ class Config:
     maker_fee: float = 0.0001
     taker_fee: float = 0.0004
     slippage_bps: float = 0.00015
-    
+
     # Risk Management & Sizing
-    base_risk: float = 0.015      # fraction of capital risked per trade if the trailing stop fires
-    max_leverage: float = 3.0
+    max_leverage: float = 2.0     # Max_Leverage_Cap for the ATR sizing engine (lowered from 3.0 -- see note below)
     max_drawdown: float = 0.20
     dd_cooldown_bars: int = 576   # bars to pause NEW entries after a max_drawdown breach (576 = ~2 days @ 5m).
                                    # Without this, the original circuit breaker is PERMANENT: once drawdown
@@ -34,26 +35,80 @@ class Config:
                                    # count can collapse to near-zero for the rest of the backtest once tripped.
                                    # After the cooldown elapses, the high-water mark resets to current capital
                                    # so trading resumes with a fresh drawdown budget instead of staying locked.
+                                   #
+                                   # BUT that reset-and-resume was itself the cause of the -99.96% result: the
+                                   # 36 breaches printed in your run each let the strategy re-arm at FULL risk
+                                   # against a fresh 20%-drawdown budget, over and over. 0.8^36 = 0.000325 --
+                                   # almost exactly the $5.49/$15,000 = 0.000366 ending ratio. The strategy
+                                   # didn't lose money in one big move; it lost ~20% in a straight line, 36
+                                   # separate times, because nothing ever asked "is this strategy actually
+                                   # working right now?" The two knobs below answer that question.
+    cooldown_growth_factor: float = 2.0   # each successive breach multiplies the cooldown length by this factor
+    max_cooldown_bars: int = 5760         # cap on any single escalated cooldown (5760 bars = ~20 days @ 5m)
+    max_total_breaches: int = 6           # hard kill-switch: after this many breaches in one run, stop trading
+                                           # entirely for the rest of the backtest and report final capital.
+                                           # Escalation turns breach #1..#6 into cooldowns of roughly 2, 4, 8,
+                                           # 16, 20(capped), 20(capped) days -- so a strategy that keeps failing
+                                           # gets throttled hard well before it reaches breach #6, instead of
+                                           # bleeding 20% on a ~2-day cycle for the whole backtest.
 
-    # Trailing Stop
-    trailing_stop_vol_mult: float = 3.5   # stop distance = this many EWMA-vol units away from peak favorable price
-    min_stop_pct: float = 0.0015          # floor on stop distance (as a % of price) so it never collapses to ~0 in dead-vol regimes
-    
+    # --- ATR-Based Position Sizing Engine ---
+    # Dollar Risk        = Equity * risk_percent
+    # Stop Loss Distance = atr_k * ATR(atr_period), floored at price * min_stop_pct
+    # Raw Size           = Dollar Risk / Stop Loss Distance
+    # Effective Leverage = (Units * Price) / Equity  -> capped at max_leverage
+    # Units              = floored to step_size, then checked against min_notional
+    #
+    # Your run showed average leverage 2.66x against a 3.0x cap -- the leverage
+    # cap was binding on almost every trade (ATR-implied stop distance is a
+    # small % of BTC's price, so raw_units/risk_percent nearly always wanted
+    # more than max_leverage allows). That decouples actual $ risk per trade
+    # from risk_percent: realized loss on a stop-out is really
+    #   ~ max_leverage * capital * (atr_k * ATR / price)
+    # and at atr_k=2.5 that produced an avg loser ($19.63) 55% BIGGER than the
+    # avg winner ($12.43) -- even at a 50.7% win rate that's a losing formula.
+    # Cutting atr_k below shrinks that loss close to linearly, since the
+    # leverage cap is what's actually binding, not risk_percent.
+    atr_period: float = 14        # ATR lookback, in 5m bars
+    atr_k: float = 1.3            # stop distance = this many ATRs from entry (lowered from 2.5 -- see note above)
+    risk_percent: float = 0.015   # fraction of equity risked per trade if the stop is hit
+    min_stop_pct: float = 0.0015  # floor on stop distance (as a % of price) so it never collapses in dead-vol regimes
+    step_size: float = 0.0001     # exchange lot/step size the final BTC quantity is floored to
+    min_notional: float = 10.0    # exchange minimum order value in USD; sizes below this are skipped
+    tp_r_multiple: float = 2.0    # take-profit distance = tp_r_multiple * stop-loss distance (R-multiple)
+    max_hold_bars: int = 90       # time-stop: force-close a trade after this many bars (~7.5hr @ 5m, ~3x
+                                   # max_half_life) if it hasn't hit SL/TP/mean-reversion yet. If price hasn't
+                                   # reverted within a few half-lives, the OU thesis for that trade has likely
+                                   # broken down -- this caps how long a stalled loser can sit open and drift
+                                   # instead of only relying on the ATR stop to eventually catch it.
+    verbose_orders: bool = False  # if True, print each bracket order (Entry/SL/TP) as it's placed
+    print_trade_log: bool = True  # if True, main() prints every closed trade to the terminal after the report
+    min_bars_between_trades: int = 12   # cooldown after any exit before a new entry is allowed (~1hr @ 5m).
+                                         # Cuts overtrading/whipsaw re-entries and is the main lever for
+                                         # trade frequency alongside z_entry below.
+
     # Mathematical Model Parameters
     ou_window: int = 40
     vol_span: int = 20
     kalman_delta: float = 0.0001  # Tighter process noise for fast mean reversion
-    
+
     # Edge Thresholds
-    # --- These four are the trade-FREQUENCY dials ---
+    # --- These four (plus min_bars_between_trades above) are the trade-FREQUENCY dials ---
     #   Lower z_entry           -> more bars qualify as "extreme" -> MORE trades
     #   Wider half-life bounds  -> more regimes pass the mean-reversion filter -> MORE trades
     #   Narrower/higher z_entry -> fewer, more selective entries -> FEWER trades
-    z_entry: float = 2.0          # Normalized entry cutoff
+    #
+    # Your run: 2730 trades/yr at z_entry=2.0. Target is 1200-1600/yr, roughly a
+    # 45-55% cut. Raised to 2.3 as a starting point + the entry cooldown above;
+    # this combination is a starting point, NOT a guaranteed hit -- your
+    # dataset's actual z-distribution determines the real trade count, so
+    # re-run and nudge z_entry by +-0.1 (frequency is fairly sensitive to it)
+    # until you land in range.
+    z_entry: float = 2.3          # Normalized entry cutoff (raised from 2.0)
     z_exit: float = 0.1           # Target mean-reversion exit boundary
     min_half_life: float = 2.0    # Lower bound for half-life (bars)
     max_half_life: float = 30.0   # Upper bound for half-life (bars)
-    
+
     # Monte Carlo Settings
     mc_simulations: int = 1000
     mc_horizon_trades: int = 100
@@ -78,7 +133,7 @@ class DataLoader:
             df = pd.read_csv(self.c.data_path)
         except FileNotFoundError:
             raise FileNotFoundError(f"CRITICAL ERROR: Data file '{self.c.data_path}' not found.")
-        
+
         required_cols = ['close']
         for col in required_cols:
             if col not in df.columns:
@@ -87,7 +142,7 @@ class DataLoader:
         if 'timestamp' in df.columns:
             df['timestamp'] = pd.to_datetime(df['timestamp'])
             df.sort_values('timestamp', inplace=True)
-            
+
         df.ffill(inplace=True)
         return df.reset_index(drop=True)
 
@@ -139,7 +194,7 @@ class DataLoader:
 # 2. MATHEMATICAL STATISTICAL ENGINE
 # ==========================================
 class StatisticalModels:
-    """Calculates Kalman Filter Residuals, OU Decay Half-Life, and EWMA Volatility."""
+    """Calculates Kalman Filter Residuals, OU Decay Half-Life, EWMA Volatility, and ATR(14)."""
     def __init__(self, c: Config):
         self.c = c
 
@@ -147,12 +202,13 @@ class StatisticalModels:
         print("      Computing continuous mathematical signals...")
         df = df.copy()
         p = df['close'].values.astype(float)
-        
+
         self._log_returns(df, p)
         self._volatility(df)
+        self._average_true_range(df)
         self._kalman_filter(df, p)
         self._ornstein_uhlenbeck(df)
-        
+
         return df
 
     def _log_returns(self, df: pd.DataFrame, p: np.ndarray):
@@ -166,56 +222,94 @@ class StatisticalModels:
         vol = pd.Series(lr).ewm(span=span, min_periods=span).std().values
         df['volatility'] = vol
 
+    def _average_true_range(self, df: pd.DataFrame):
+        """
+        Wilder's Average True Range over self.c.atr_period bars -- this is the
+        volatility measure that now drives position sizing, the trailing stop,
+        and the bracket-order SL/TP legs (replacing the old EWMA-vol distance).
+
+        True Range needs high/low/close. If the feed doesn't have 'high'/'low'
+        columns, falls back to a close-to-close proxy (|close_t - close_{t-1}|),
+        which understates true intrabar range -- a real OHLC feed is strongly
+        preferred for live sizing.
+        """
+        close = df['close'].values.astype(float)
+        n = len(close)
+        has_hl = 'high' in df.columns and 'low' in df.columns
+
+        if has_hl:
+            high = df['high'].values.astype(float)
+            low = df['low'].values.astype(float)
+            prev_close = np.roll(close, 1)
+            prev_close[0] = close[0]
+            tr = np.maximum.reduce([
+                high - low,
+                np.abs(high - prev_close),
+                np.abs(low - prev_close),
+            ])
+        else:
+            print("      WARNING: 'high'/'low' columns not found -- using close-to-close "
+                  "proxy for True Range. Supply an OHLC feed for accurate ATR sizing.")
+            tr = np.zeros(n)
+            tr[1:] = np.abs(close[1:] - close[:-1])
+
+        period = int(self.c.atr_period)
+        # Wilder's smoothing is equivalent to an EWM with alpha = 1/period.
+        atr = pd.Series(tr).ewm(alpha=1.0 / period, adjust=False, min_periods=period).mean().values
+
+        df['true_range'] = tr
+        df['atr'] = atr
+
     def _kalman_filter(self, df: pd.DataFrame, p: np.ndarray):
         """1D Online State Estimator to extract non-lagging smooth trend line."""
         n = len(p)
         d = self.c.kalman_delta
         xe, pe = p[0], 1.0
         dev = np.zeros(n)
-        
+
         obs_noise = 0.05
-        
+
         for i in range(1, n):
             xp, pp = xe, pe + d
             k = pp / (pp + obs_noise)
             xe = xp + k * (p[i] - xp)
             pe = (1 - k) * pp
             dev[i] = p[i] - xe
-            
+
         df['kalman_mean'] = xe
         df['kalman_dev'] = dev
 
     def _ornstein_uhlenbeck(self, df: pd.DataFrame):
         """
-        Estimates the mean-reverting speed (theta) and half-life (tau) 
+        Estimates the mean-reverting speed (theta) and half-life (tau)
         via discrete AR(1) OLS on Kalman residuals: dX_t = lambda * X_{t-1} + e_t
         """
         dev = df['kalman_dev'].values
         n = len(dev)
         w = self.c.ou_window
-        
+
         ou_z = np.full(n, np.nan)
         half_life = np.full(n, np.nan)
-        
+
         for i in range(w, n):
             s = dev[i-w+1:i+1]
             x_t = s[:-1]
             x_tp1 = s[1:]
-            
+
             cov_m = np.cov(x_t, x_tp1)
             var_x = cov_m[0, 0]
-            
+
             if var_x > 1e-12:
                 b = cov_m[0, 1] / var_x
                 if 0 < b < 1.0:
                     lmbda = b - 1.0
                     hl = -np.log(2) / lmbda
                     half_life[i] = hl
-            
+
             std = np.std(s, ddof=1)
             if std > 1e-12:
                 ou_z[i] = dev[i] / std
-                
+
         df['ou_zscore'] = ou_z
         df['half_life'] = half_life
 
@@ -232,49 +326,67 @@ class SignalEngine:
         print("      Filtering signals via stationarity criteria...")
         n = len(df)
         sig = np.zeros(n, dtype=np.int8)
-        
+
         z = df['ou_zscore'].values
         hl = df['half_life'].values
-        
+
         for i in range(n):
             if np.isnan(z[i]) or np.isnan(hl[i]):
                 continue
-                
+
             is_mean_reverting = self.c.min_half_life <= hl[i] <= self.c.max_half_life
-            
+
             if is_mean_reverting:
                 if z[i] <= -self.c.z_entry:
                     sig[i] = 1   # Long Entry
                 elif z[i] >= self.c.z_entry:
                     sig[i] = -1  # Short Entry
-                    
+
         return sig
 
 
 # ==========================================
-# 4. VOLATILITY-AWARE RISK MANAGER
+# 4. ATR-BASED RISK MANAGER
 # ==========================================
 class RiskManager:
     """
-    Handles portfolio risk, drawdown stops, and position sizing.
+    ATR-based position-sizing engine, evaluated fresh on every 5-minute bar close:
 
-    Sizing is now genuinely risk-based: given the trailing-stop distance for
-    the current volatility regime, the position is sized so that a full stop-out
-    costs exactly `base_risk` (scaled by signal strength) of current capital --
-    then hard-capped at `max_leverage`.
+        Dollar Risk         = Equity * Risk_Percent
+        Stop Loss Distance  = atr_k * ATR(atr_period), floored at price * min_stop_pct
+        Raw Position Size   = Dollar Risk / Stop Loss Distance
+        Effective Leverage  = (Units * Price) / Equity
+            -> if Effective Leverage > Max_Leverage_Cap:
+                   Units = (Equity * Max_Leverage_Cap) / Price
+        Units               = floored to the exchange step_size
+        Notional            = Units * Price
+            -> if Notional < min_notional: the trade is skipped (size = 0)
 
-    NOTE on the previous version's bug: it computed
-        risk_fraction = base_risk * edge * vol_scalar   (capped at 0.05)
-        pos_value     = capital * risk_fraction * max_leverage
-        leverage      = pos_value / capital  =  risk_fraction * max_leverage
-    Since risk_fraction was hard-capped at 0.05, leverage could never exceed
-    0.05 * max_leverage = 0.15x -- regardless of what max_leverage was set to.
-    That's exactly the 0.09x avg / 0.15x max leverage seen in the OOS report,
-    and why trades were only ever a few dollars in size.
+    The same stop_distance also drives the trailing stop in the Backtester and
+    feeds build_bracket_order() to compute the SL/TP legs of the entry order.
 
-    Also fixes a second bug: the drawdown circuit breaker used to be a
-    permanent one-way lockout (see is_trading_allowed below) -- now it's a
-    cooldown that resets the high-water mark and resumes trading.
+    NOTE on the drawdown circuit breaker (is_trading_allowed): a naive
+    `drawdown < max_drawdown` check is a ONE-WAY door -- once drawdown crosses
+    the limit, no new trades can open, so capital can never move again, so
+    drawdown never falls back below the limit either. That silently locks
+    trading for the rest of the backtest.
+
+    A plain cooldown-and-reset fixes THAT bug but creates a different one: it
+    lets a strategy that has gone into a losing regime re-arm at full risk
+    against a fresh 20%-drawdown budget indefinitely, bleeding ~20% per cycle
+    forever (this is exactly what produced the -99.96% result -- 36 breaches,
+    each one a fresh ~20% haircut: 0.8^36 = 0.000325 vs the observed
+    0.000366 final/initial ratio). So this version adds two more things on
+    top of the cooldown-and-reset:
+
+      1. ESCALATION: each successive breach multiplies the cooldown length by
+         cooldown_growth_factor (capped at max_cooldown_bars). A strategy
+         that keeps failing gets throttled harder and harder instead of
+         retrying on the same ~2-day cycle every time.
+      2. KILL SWITCH: after max_total_breaches breaches in one run, trading
+         halts entirely for the rest of the backtest. Repeated breaches are
+         treated as evidence the strategy isn't working right now, not as
+         routine noise to reset past.
     """
     def __init__(self, c: Config):
         self.c = c
@@ -283,26 +395,17 @@ class RiskManager:
         self.cooldown_end_bar = None   # None = not currently halted
         self.breach_count = 0
         self.halted_bars = 0
+        self.halted_permanently = False
 
     def update_pnl(self, pnl: float):
         self.capital += pnl
         self.peak_capital = max(self.peak_capital, self.capital)
 
     def is_trading_allowed(self, bar_idx: int) -> bool:
-        """
-        Drawdown circuit breaker with a cooldown + high-water-mark reset.
+        """Drawdown circuit breaker with escalating cooldowns + a hard kill switch (see class docstring)."""
+        if self.halted_permanently:
+            return False
 
-        The original version just returned `drawdown < max_drawdown`. That's a
-        ONE-WAY door: once drawdown crosses the limit, no new trades can open,
-        so capital can never move again, so drawdown never falls back below the
-        limit either -- trading stays locked for the rest of the backtest. That
-        silent permanent lockout is what was collapsing trade counts to a
-        handful once a leveraged run hit a rough patch early in the sample.
-
-        Now: a breach starts a cooldown of `dd_cooldown_bars`. Once the
-        cooldown elapses, the high-water mark resets to current capital (a
-        fresh drawdown budget) and trading resumes.
-        """
         if self.cooldown_end_bar is not None:
             if bar_idx < self.cooldown_end_bar:
                 self.halted_bars += 1
@@ -314,48 +417,103 @@ class RiskManager:
         drawdown = (self.peak_capital - self.capital) / self.peak_capital
         if drawdown >= self.c.max_drawdown:
             self.breach_count += 1
-            self.cooldown_end_bar = bar_idx + self.c.dd_cooldown_bars
             self.halted_bars += 1
+
+            if self.breach_count >= self.c.max_total_breaches:
+                self.halted_permanently = True
+                print(f"      [KILL SWITCH] {self.breach_count} drawdown breaches reached -- "
+                      f"halting all further trading. Capital: ${self.capital:,.2f}")
+                return False
+
+            cooldown = min(
+                self.c.dd_cooldown_bars * (self.c.cooldown_growth_factor ** (self.breach_count - 1)),
+                self.c.max_cooldown_bars,
+            )
+            self.cooldown_end_bar = bar_idx + int(cooldown)
             return False
 
         return True
 
-    def get_stop_distance(self, price: float, vol: float) -> float:
-        """Trailing-stop distance in price terms, floored so it never collapses to ~0."""
-        vol_distance = price * vol * self.c.trailing_stop_vol_mult
-        floor_distance = price * self.c.min_stop_pct
-        return max(vol_distance, floor_distance)
+    @staticmethod
+    def floor_to_step(quantity: float, step_size: float) -> float:
+        """Rounds a quantity DOWN to the nearest exchange lot/step size."""
+        if step_size <= 0 or quantity <= 0:
+            return max(quantity, 0.0)
+        return math.floor(quantity / step_size) * step_size
 
-    def get_position_size(self, price: float, vol: float, z_score: float, bar_idx: int) -> tuple[float, float, float]:
-        """Returns (btc_size, leverage, stop_distance)."""
-        if not self.is_trading_allowed(bar_idx) or np.isnan(vol) or vol <= 0:
+    def get_atr_stop_distance(self, price: float, atr: float) -> float:
+        """Stop Loss Distance = atr_k * ATR(14), floored so it never collapses to ~0 in dead-vol regimes."""
+        if atr is None or np.isnan(atr) or atr <= 0:
+            return 0.0
+        atr_distance = self.c.atr_k * atr
+        floor_distance = price * self.c.min_stop_pct
+        return max(atr_distance, floor_distance)
+
+    def get_position_size(self, price: float, atr: float, z_score: float, bar_idx: int) -> tuple[float, float, float]:
+        """
+        Returns (units, effective_leverage, stop_distance). units == 0.0 whenever
+        no trade should be taken: trading halted, ATR unavailable, or the final
+        floored quantity fails the exchange min-notional check.
+        """
+        if not self.is_trading_allowed(bar_idx):
             return 0.0, 1.0, 0.0
 
-        stop_distance = self.get_stop_distance(price, vol)
+        stop_distance = self.get_atr_stop_distance(price, atr)
         if stop_distance <= 0:
             return 0.0, 1.0, 0.0
 
-        edge = min(abs(z_score) / self.c.z_entry, 2.0)     # 1.0 -> 2.0, stronger signal = more risk
-        risk_fraction = self.c.base_risk * (edge / 2.0)
-        risk_dollars = self.capital * risk_fraction
+        # --- Step 1: Dollar Risk & raw size ---
+        dollar_risk = self.capital * self.c.risk_percent
+        raw_units = dollar_risk / stop_distance
 
-        btc_size = risk_dollars / stop_distance
-        pos_value = btc_size * price
-        leverage = pos_value / self.capital
+        # --- Step 2: Effective Leverage check & override ---
+        pos_value = raw_units * price
+        effective_leverage = pos_value / self.capital
 
-        if leverage > self.c.max_leverage:
-            leverage = self.c.max_leverage
-            pos_value = self.capital * leverage
-            btc_size = pos_value / price
+        if effective_leverage > self.c.max_leverage:
+            units = (self.capital * self.c.max_leverage) / price
+        else:
+            units = raw_units
 
-        return btc_size, leverage, stop_distance
+        # --- Step 3: floor to exchange step size, verify min notional ---
+        units = self.floor_to_step(units, self.c.step_size)
+        notional = units * price
+
+        if units <= 0 or notional < self.c.min_notional:
+            return 0.0, 1.0, 0.0
+
+        effective_leverage = (units * price) / self.capital  # recompute off the floored qty for accurate reporting
+        return units, effective_leverage, stop_distance
+
+    def build_bracket_order(self, entry_price: float, direction: int, stop_distance: float) -> dict:
+        """
+        Builds the bracket order legs for a new position.
+        direction: +1 for long, -1 for short.
+        Take-profit distance = tp_r_multiple * stop_distance (a fixed R-multiple target).
+        """
+        tp_distance = stop_distance * self.c.tp_r_multiple
+        if direction == 1:
+            sl = entry_price - stop_distance
+            tp = entry_price + tp_distance
+        else:
+            sl = entry_price + stop_distance
+            tp = entry_price - tp_distance
+
+        return {
+            "direction": "LONG" if direction == 1 else "SHORT",
+            "entry": entry_price,
+            "stop_loss": sl,
+            "take_profit": tp,
+            "stop_distance": stop_distance,
+            "tp_distance": tp_distance,
+        }
 
 
 # ==========================================
 # 5. BACKTEST ENGINE
 # ==========================================
 class Backtester:
-    """Executes trades with friction, slippage, mean-reversion exits, and a trailing stop."""
+    """Executes trades with friction, slippage, mean-reversion exits, and an ATR-based bracket (SL/TP)."""
     def __init__(self, c: Config, df: pd.DataFrame, signals: np.ndarray, rm: RiskManager):
         self.c = c
         self.df = df
@@ -366,7 +524,7 @@ class Backtester:
         print("      Executing trade simulation...")
         trades = []
         equity_curve = [self.rm.capital]
-        
+
         pos_size = 0.0
         entry_price = 0.0
         pos_dir = 0
@@ -374,37 +532,52 @@ class Backtester:
         lev = 1.0
         stop_distance = 0.0
         trail_stop = None
+        take_profit = None
         peak_price = None
-        
+        last_exit_bar = -self.c.min_bars_between_trades  # allow an entry on bar 1 if signaled
+
         p = self.df['close'].values
         z = self.df['ou_zscore'].values
-        v = self.df['volatility'].values
-        
+        a = self.df['atr'].values
+
         for i in range(1, len(self.df)):
             sig = self.signals[i]
             price = p[i]
             z_val = z[i]
 
-            # --- Update trailing stop for an open position ---
+            # --- Update trailing stop & check take-profit / time-stop for an open position ---
             stopped_out = False
+            hit_tp = False
+            timed_out = False
             if pos_size != 0:
+                timed_out = (i - entry_idx) >= self.c.max_hold_bars
                 if pos_dir == 1:
                     peak_price = max(peak_price, price)
                     trail_stop = peak_price - stop_distance
                     stopped_out = price <= trail_stop
+                    hit_tp = price >= take_profit
                 else:
                     peak_price = min(peak_price, price)
                     trail_stop = peak_price + stop_distance
                     stopped_out = price >= trail_stop
+                    hit_tp = price <= take_profit
 
+            # Priority when multiple conditions trip on the same bar: TP (best case) > price
+            # stop (risk control) > time-stop (thesis stalled) > signal flip > mean-reversion.
             should_exit = False
             exit_reason = None
-            if pos_dir == 1 and (z_val >= -self.c.z_exit or sig == -1 or stopped_out):
+            if pos_dir == 1 and (z_val >= -self.c.z_exit or sig == -1 or stopped_out or hit_tp or timed_out):
                 should_exit = True
-                exit_reason = 'trailing_stop' if stopped_out else ('signal_flip' if sig == -1 else 'mean_reversion')
-            elif pos_dir == -1 and (z_val <= self.c.z_exit or sig == 1 or stopped_out):
+                exit_reason = ('take_profit' if hit_tp else
+                               'trailing_stop' if stopped_out else
+                               'time_stop' if timed_out else
+                               'signal_flip' if sig == -1 else 'mean_reversion')
+            elif pos_dir == -1 and (z_val <= self.c.z_exit or sig == 1 or stopped_out or hit_tp or timed_out):
                 should_exit = True
-                exit_reason = 'trailing_stop' if stopped_out else ('signal_flip' if sig == 1 else 'mean_reversion')
+                exit_reason = ('take_profit' if hit_tp else
+                               'trailing_stop' if stopped_out else
+                               'time_stop' if timed_out else
+                               'signal_flip' if sig == 1 else 'mean_reversion')
 
             # Exit Order
             if pos_size != 0 and should_exit:
@@ -412,40 +585,55 @@ class Backtester:
                 pnl = pos_size * (exit_price - entry_price) if pos_dir == 1 else pos_size * (entry_price - exit_price)
                 fee = (pos_size * exit_price) * self.c.taker_fee
                 net_pnl = pnl - fee
-                
+
                 self.rm.update_pnl(net_pnl)
                 trades.append({
                     'pnl': net_pnl,
                     'hold_bars': i - entry_idx,
                     'leverage': lev,
                     'exit_reason': exit_reason,
+                    'entry_price': entry_price,
+                    'stop_loss': trail_stop if pos_dir == 1 else trail_stop,
+                    'take_profit': take_profit,
+                    'exit_price': exit_price,
                 })
                 pos_size, entry_price, pos_dir = 0.0, 0.0, 0
-                trail_stop, peak_price, stop_distance = None, None, 0.0
-                
+                trail_stop, take_profit, peak_price, stop_distance = None, None, None, 0.0
+                last_exit_bar = i
+
             # Entry Order
-            if sig != 0 and pos_size == 0:
-                sz, l, sd = self.rm.get_position_size(price, v[i], z_val, i)
+            cooldown_elapsed = (i - last_exit_bar) >= self.c.min_bars_between_trades
+            if sig != 0 and pos_size == 0 and cooldown_elapsed:
+                sz, l, sd = self.rm.get_position_size(price, a[i], z_val, i)
                 if sz > 0:
                     entry_price = price + (price * self.c.slippage_bps * sig)
                     fee = (sz * entry_price) * self.c.taker_fee
                     self.rm.update_pnl(-fee)
-                    
+
                     pos_size, pos_dir, lev, entry_idx = sz, sig, l, i
                     stop_distance = sd
                     peak_price = entry_price
-                    
+
+                    bracket = self.rm.build_bracket_order(entry_price, sig, stop_distance)
+                    trail_stop = bracket['stop_loss']
+                    take_profit = bracket['take_profit']
+
+                    if self.c.verbose_orders:
+                        print(f"      [BRACKET] {bracket['direction']:<5} qty={sz:.6f}  "
+                              f"entry={bracket['entry']:.2f}  sl={bracket['stop_loss']:.2f}  "
+                              f"tp={bracket['take_profit']:.2f}  leverage={l:.2f}x")
+
             equity_curve.append(self.rm.capital)
-            
+
         trades_df = pd.DataFrame(trades) if len(trades) > 0 else pd.DataFrame(
-            columns=['pnl', 'hold_bars', 'leverage', 'exit_reason']
+            columns=['pnl', 'hold_bars', 'leverage', 'exit_reason', 'entry_price', 'stop_loss', 'take_profit', 'exit_price']
         )
 
         if self.rm.breach_count > 0:
             halted_pct = self.rm.halted_bars / len(self.df) * 100
+            status = "KILL SWITCH TRIPPED" if self.rm.halted_permanently else "cooldowns only"
             print(f"      Drawdown breaches: {self.rm.breach_count}  |  "
-                  f"bars halted: {self.rm.halted_bars} ({halted_pct:.1f}% of period, "
-                  f"{self.c.dd_cooldown_bars}-bar cooldown each)")
+                  f"bars halted: {self.rm.halted_bars} ({halted_pct:.1f}% of period, escalating cooldowns, {status})")
 
         return pd.Series(equity_curve), trades_df
 
@@ -770,6 +958,84 @@ def run_period_backtest(c: Config, df: pd.DataFrame, label: str) -> tuple[pd.Ser
     return equity, trades, metrics
 
 
+def run_z_entry_sweep(
+    base_config: Config,
+    df: pd.DataFrame,
+    candidates: list[float],
+    target_range: tuple[float, float] = (1200, 1600),
+) -> pd.DataFrame:
+    """
+    z_entry=2.3 is a starting point, not a guaranteed hit -- the real trade
+    count depends on your dataset's actual z-score distribution, which I
+    don't have. This runs the full OOS backtest once per candidate z_entry
+    and reports trades/year + key stats for each, so you can read off
+    whichever value actually lands inside target_range on YOUR data instead
+    of guessing blind.
+
+    Usage: python mean_reversion_backtest.py --sweep
+    """
+    rows = []
+    for z in candidates:
+        c = replace(base_config, z_entry=z)
+        _, _, metrics = run_period_backtest(c, df.copy(), label=f"z_entry={z}")
+        if metrics is None:
+            rows.append({"z_entry": z, "trades_per_year": 0, "win_rate": None,
+                         "profit_factor": None, "total_return": None,
+                         "max_drawdown": None, "in_target": False})
+            continue
+        tpy = round(metrics["trades_per_year"])
+        rows.append({
+            "z_entry": z,
+            "trades_per_year": tpy,
+            "win_rate": round(metrics["win_rate"], 2),
+            "profit_factor": round(metrics["profit_factor"], 2),
+            "total_return": round(metrics["total_return"], 2),
+            "max_drawdown": round(metrics["max_drawdown"], 2),
+            "in_target": target_range[0] <= tpy <= target_range[1],
+        })
+
+    sweep_df = pd.DataFrame(rows)
+    print("\n" + "=" * 78)
+    print(f"  Z_ENTRY SWEEP  (target trades/year: {target_range[0]}-{target_range[1]})")
+    print("=" * 78)
+    print(sweep_df.to_string(index=False))
+    print("=" * 78)
+    hits = sweep_df[sweep_df["in_target"]]
+    if len(hits) > 0:
+        print(f"In target range: z_entry in {hits['z_entry'].tolist()}")
+    else:
+        print("Nothing in range yet -- widen the candidates list based on the trend above "
+              "(higher z_entry = fewer trades) and re-run.")
+    return sweep_df
+
+
+def print_trade_log(trades_df: pd.DataFrame, label: str = "Trade Log") -> None:
+    """
+    Prints every trade in trades_df to the terminal (no row truncation),
+    numbered in execution order. Rounds price/PnL columns for readability;
+    doesn't touch the underlying trades_df.
+    """
+    if len(trades_df) == 0:
+        print(f"\n[{label}] No trades to display.")
+        return
+
+    display_df = trades_df.copy()
+    display_df.insert(0, 'trade_#', range(1, len(display_df) + 1))
+
+    for col in ['pnl', 'entry_price', 'stop_loss', 'take_profit', 'exit_price']:
+        if col in display_df.columns:
+            display_df[col] = display_df[col].round(2)
+    if 'leverage' in display_df.columns:
+        display_df['leverage'] = display_df['leverage'].round(3)
+
+    print("\n" + "=" * 110)
+    print(f"  {label.upper()}  ({len(display_df)} trades)")
+    print("=" * 110)
+    with pd.option_context('display.max_rows', None, 'display.max_columns', None, 'display.width', 200):
+        print(display_df.to_string(index=False))
+    print("=" * 110)
+
+
 # ==========================================
 # MAIN EXECUTION PIPELINE
 # ==========================================
@@ -782,6 +1048,11 @@ def main():
     # Use chronological split; only backtest the most recent OOS window
     _, oos_df = loader.split_is_oos(full_df)
 
+    if "--sweep" in sys.argv:
+        candidates = [1.9, 2.0, 2.1, 2.2, 2.3, 2.4, 2.5, 2.6, 2.8, 3.0]
+        run_z_entry_sweep(c, oos_df, candidates)
+        return
+
     print("[2/3] Running Out-of-Sample backtest (1 year)...")
     oos_df = StatisticalModels(c).compute(oos_df)
     signals = SignalEngine(c).generate(oos_df)
@@ -791,6 +1062,9 @@ def main():
     PerformanceReport(
         c, oos_equity, oos_trades, label="Out-of-Sample (1Y)", df=oos_df
     ).generate(plot=True)
+
+    if c.print_trade_log:
+        print_trade_log(oos_trades, label="Out-of-Sample Trade Log")
 
 if __name__ == "__main__":
     main()

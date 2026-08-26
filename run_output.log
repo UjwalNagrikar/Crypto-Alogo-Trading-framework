@@ -1,0 +1,306 @@
+==============================================================================
+BTCUSD 5-MINUTE NON-ML STATISTICAL TRADING SYSTEM
+==============================================================================
+Machine Learning: STRICTLY DISABLED   |   Technical Indicators: NONE
+Dependencies: numpy 2.5.2, pandas 3.0.5
+==============================================================================
+STEP 1/9  DATASET INSPECTION & LOADING
+==============================================================================
+[    0.2s] Raw columns detected: ['timestamp', 'open', 'high', 'low', 'close', 'volume', 'quote_volume', 'trade_count', 'taker_buy_volume', 'taker_sell_volume', 'taker_buy_quote_volume', 'taker_sell_quote_volume']
+[    0.2s] Schema mapping (canonical -> actual):
+    timestamp          <- timestamp
+    open               <- open
+    high               <- high
+    low                <- low
+    close              <- close
+    volume             <- volume
+    quote_volume       <- quote_volume
+    trade_count        <- trade_count
+    taker_buy_volume   <- taker_buy_volume
+    taker_sell_volume  <- taker_sell_volume
+[    5.9s] Loaded 525,560 rows.
+[    8.4s] Optional fields present: ['quote_volume', 'trade_count', 'taker_buy_volume', 'taker_sell_volume']
+[    8.4s] NOTE: funding_rate / bid-ask / spread NOT in dataset -> modelled as configurable cost assumptions (see Config).
+==============================================================================
+STEP 2/9  DATA VALIDATION
+==============================================================================
+[    8.9s] INFO: 2 gaps > 1 bar (2 exceed 3 bars). Largest gap = 0 days 02:05:00. Gaps are tolerated (no synthetic bars inserted).
+[    8.9s] Validation complete: 525,560 clean bars (0 removed).
+[    8.9s] Range: 2021-08-24 18:25:00  ->  2026-08-23 18:20:00  (UTC)
+==============================================================================
+STEP 3/9  CHRONOLOGICAL IS / OOS SPLIT
+==============================================================================
+[    8.9s] IS : 2021-08-24 18:25:00  ->  2025-08-23 18:15:00  (420,439 bars)
+[    8.9s] OOS: 2025-08-23 18:20:00  ->  2026-08-23 18:20:00  (105,121 bars)  [LOCKED until strategy freeze]
+==============================================================================
+CONFIGURATION (frozen before OOS)
+==============================================================================
+  Data Start:      2021-08-24 18:25:00
+  Data End:        2026-08-23 18:20:00
+  IS Start:        2021-08-24 18:25:00
+  IS End:          2025-08-23 18:15:00
+  OOS Start:       2025-08-23 18:20:00
+  OOS End:         2026-08-23 18:20:00
+  Number of Candles: 525,560
+  Initial Capital: $10,000.00
+  Taker Fee:       0.040%   Maker Fee: 0.020%
+  Slippage:        0.010%   Half-Spread: 0.010%
+  Funding/8h:      0.010%
+  Leverage (max):  3.0x   Risk/Trade: 0.50%
+  Random Seed:     42
+==============================================================================
+STEP 4/9  STATISTICAL FEATURE ENGINE (causal, non-ML, no indicators)
+==============================================================================
+[    8.9s]   returns, rolling distribution, z-scores ...
+[    9.3s]   realized volatility, skewness, kurtosis ...
+[    9.5s]   multi-horizon momentum & acceleration ...
+[    9.7s]   autocorrelation & directional persistence ...
+[   10.5s]   Hurst exponent (structure-function) ...
+[   11.2s]   Ornstein-Uhlenbeck mean-reversion speed & half-life ...
+[   11.7s]   features ready. warm-up = 303 bars.
+[   14.7s]   change-point cooldown active on  1.93% of bars.
+==============================================================================
+STEP 5/9  TRIPLE-BARRIER OUTCOME MATRIX (vectorised)
+==============================================================================
+[   16.3s]   outcomes computed for 525,440 decidable bars.
+==============================================================================
+STEP 6/9  WALK-FORWARD VALIDATION (in-sample only)
+==============================================================================
+[   18.5s]   fold 1: trades=  696  ret= -31.15%  PF=0.69  Sharpe=-5.08  win=43.4%
+[   22.8s]   fold 2: trades=  168  ret=  -7.52%  PF=0.72  Sharpe=-1.79  win=44.6%
+[   26.8s]   fold 3: trades=   49  ret=  -3.31%  PF=0.62  Sharpe=-1.36  win=34.7%
+[   30.8s]   fold 4: trades=    0  ret=   0.00%  PF=0.00  Sharpe=0.00  win=0.0%
+[   30.8s]   WF summary: 0/4 folds profitable; median PF=0.65, median Sharpe=-1.58
+==============================================================================
+STEP 7/9  ROBUSTNESS & SENSITIVITY (in-sample only)
+==============================================================================
+[   36.5s]   baseline                 trades=    0  ret=   0.00%  PF=0.00  Sharpe=0.00
+[   42.5s]   k_sl-15%                 trades=    0  ret=   0.00%  PF=0.00  Sharpe=0.00
+[   48.6s]   k_sl+15%                 trades=    0  ret=   0.00%  PF=0.00  Sharpe=0.00
+[   54.0s]   k_tp-15%                 trades=    0  ret=   0.00%  PF=0.00  Sharpe=0.00
+[   59.7s]   k_tp+15%                 trades=    0  ret=   0.00%  PF=0.00  Sharpe=0.00
+[   65.3s]   prob_edge=0              trades=    0  ret=   0.00%  PF=0.00  Sharpe=0.00
+[   70.9s]   prob_edge=0.04           trades=    0  ret=   0.00%  PF=0.00  Sharpe=0.00
+[   76.2s]   costs x2                 trades=    0  ret=   0.00%  PF=0.00  Sharpe=0.00
+[   86.1s]   windows x1.5             trades=    0  ret=   0.00%  PF=0.00  Sharpe=0.00
+[   86.1s]   robustness: 0/9 variants profitable on IS validation slice.
+[   88.6s] Look-ahead causality self-check: PASS
+==============================================================================
+FREEZE STRATEGY / PARAMETERS / THRESHOLDS -> RUN OOS ONCE
+==============================================================================
+[   89.9s] Frozen calibration: 0/376 well-sampled states clear the EV>0 + prob-edge gate (median cell EV -0.1216%, cost hurdle 0.120%).
+[   94.6s] IS (reference): trades=0, return=0.00%, PF=0.00, Sharpe=0.00
+[   97.7s] OOS principled engine (EV>0 gate): 0 trades -> no cost-surviving edge; the engine stays flat.
+[  100.1s] OOS no-edge baseline (EV gate removed): trades=4,586, return=-99.27%, PF=0.49, Sharpe=-18.88  [expected to lose -- reported for honesty]
+[  100.4s] Saved 4,586 OOS baseline trades -> out_of_sample_trades.csv
+==============================================================================
+STEP 8/9  MONTE-CARLO SIMULATION (bootstrap of OOS trades)
+==============================================================================
+[  101.7s]   simulated 2,000/10,000 paths ...
+[  102.8s]   simulated 4,000/10,000 paths ...
+[  103.6s]   simulated 6,000/10,000 paths ...
+[  105.2s]   simulated 8,000/10,000 paths ...
+[  106.0s]   simulated 10,000/10,000 paths ...
+[  106.0s]   P(loss)=100.0%  median final=$73  [5th $48, 95th $113]
+==============================================================================
+STEP 9/9  VISUALISATION & EXPORT
+==============================================================================
+[  121.6s]   saved: equity_curve.png, drawdown.png, oos_monthly_returns.png, oos_trade_distribution.png, oos_cumulative_pnl.png,
+[  121.6s]          monte_carlo_equity_paths.png, monte_carlo_final_equity.png, monte_carlo_drawdown.png
+==============================================================================
+OUT-OF-SAMPLE TRADE LOG  (no-edge baseline -- principled engine took 0 trades)
+==============================================================================
+
+  OOS trade table (first 12 rows):
+      entry_time        exit_time  side  entry_price  exit_price  net_pnl  return_pct exit_reason       strategy         regime
+2025-08-23 18:25 2025-08-23 20:20 SHORT    115106.60   115214.03   -26.00      -0.260    max_hold MEAN_REVERSION LOW_VOLATILITY
+2025-08-23 20:30 2025-08-23 22:25  LONG    115249.35   115255.66   -11.83      -0.119    max_hold MEAN_REVERSION LOW_VOLATILITY
+2025-08-23 22:35 2025-08-24 00:30  LONG    115301.06   115415.52     2.56       0.026    max_hold MEAN_REVERSION LOW_VOLATILITY
+2025-08-24 00:40 2025-08-24 02:35  LONG    115461.70   115216.59   -53.94      -0.541    max_hold  VOL_EXPANSION LOW_VOLATILITY
+2025-08-24 02:45 2025-08-24 04:40  LONG    115233.26   115100.64   -33.59      -0.339    max_hold MEAN_REVERSION LOW_VOLATILITY
+2025-08-24 04:50 2025-08-24 06:45  LONG    115131.30   114890.27   -44.56      -0.451    max_hold MEAN_REVERSION LOW_VOLATILITY
+2025-08-24 06:55 2025-08-24 08:50 SHORT    114832.82   114833.29   -13.75      -0.140    max_hold       MOMENTUM LOW_VOLATILITY
+2025-08-24 09:00 2025-08-24 10:55  LONG    114860.99   114767.44   -24.80      -0.253    max_hold MEAN_REVERSION MEAN_REVERTING
+2025-08-24 11:05 2025-08-24 13:00 SHORT    114855.44   114652.50    12.81       0.131    max_hold MEAN_REVERSION MEAN_REVERTING
+2025-08-24 13:10 2025-08-24 15:05  LONG    114677.87   114749.52    -2.81      -0.029    max_hold       MOMENTUM MEAN_REVERTING
+2025-08-24 15:15 2025-08-24 17:10 SHORT    114674.28   114482.38    10.45       0.107    max_hold  VOL_EXPANSION MEAN_REVERTING
+2025-08-24 17:20 2025-08-24 19:15  LONG    114343.88   114618.74    18.70       0.191    max_hold MEAN_REVERSION MEAN_REVERTING
+
+============================================================
+OUT-OF-SAMPLE TRADE #001
+============================================================
+Entry Time:       2025-08-23 18:25:00
+Exit Time:        2025-08-23 20:20:00
+Side:             SHORT
+Entry Price:      115106.60
+Exit Price:       115214.03
+Position Size:    $14791.90
+Gross P&L:        $-7.88
+Fees:             $11.8335
+Slippage+Spread:  $5.9168
+Funding:          $0.3698
+Net P&L:          $-26.00
+Return:           -0.260%
+Holding Time:     120 min
+Exit Reason:      max_hold
+Strategy:         MEAN_REVERSION
+Regime:           LOW_VOLATILITY
+Probability:      0.310
+Expected Return:  -0.00111
+Expected Value:   -0.00111
+============================================================
+
+============================================================
+OUT-OF-SAMPLE TRADE #002
+============================================================
+Entry Time:       2025-08-23 20:30:00
+Exit Time:        2025-08-23 22:25:00
+Side:             LONG
+Entry Price:      115249.35
+Exit Price:       115255.66
+Position Size:    $15365.61
+Gross P&L:        $6.99
+Fees:             $12.2925
+Slippage+Spread:  $6.1462
+Funding:          $0.3841
+Net P&L:          $-11.83
+Return:           -0.119%
+Holding Time:     120 min
+Exit Reason:      max_hold
+Strategy:         MEAN_REVERSION
+Regime:           LOW_VOLATILITY
+Probability:      0.320
+Expected Return:  -0.00112
+Expected Value:   -0.00112
+============================================================
+
+============================================================
+OUT-OF-SAMPLE TRADE #003
+============================================================
+Entry Time:       2025-08-23 22:35:00
+Exit Time:        2025-08-24 00:30:00
+Side:             LONG
+Entry Price:      115301.06
+Exit Price:       115415.52
+Position Size:    $15221.96
+Gross P&L:        $21.21
+Fees:             $12.1776
+Slippage+Spread:  $6.0888
+Funding:          $0.3805
+Net P&L:          $2.56
+Return:           0.026%
+Holding Time:     120 min
+Exit Reason:      max_hold
+Strategy:         MEAN_REVERSION
+Regime:           LOW_VOLATILITY
+Probability:      0.320
+Expected Return:  -0.00112
+Expected Value:   -0.00112
+============================================================
+[  121.8s] Saved frozen_config.json
+==============================================================================
+BTCUSD 5-MINUTE NON-ML STATISTICAL TRADING SYSTEM
+FINAL OUT-OF-SAMPLE REPORT
+==============================================================================
+
+Data:
+  5-year dataset (2021-08-24 18:25:00 -> 2026-08-23 18:20:00)
+  420,439-bar development (in-sample)
+  105,121-bar out-of-sample (final 1 year)
+
+Strategy:            Non-ML Statistical Ensemble (MeanRev / Momentum / VolExp / OU)
+Machine Learning:    STRICTLY DISABLED
+Technical Indicators: NONE
+
+------------------------------------------------------------
+PRINCIPLED ENGINE (EV>0 gate) -- THE ACTUAL STRATEGY
+------------------------------------------------------------
+
+OOS Trades Taken:    0
+OOS Net P&L:         $0.00
+OOS Total Return:    0.00%
+
+The engine requires a frozen empirical expected value that survives all modelled
+costs (round-trip ~0.120%) plus a directional probability edge.
+On the full 4-year in-sample calibration, 0 of 376 well-sampled
+statistical states clear that bar (median well-sampled cell EV = -0.1216%,
+best = +0.0227%, only 0.53% even have EV>0).  The engine
+therefore correctly takes no positions at all.
+PRIMARY FINDING: at 5-minute frequency the conditional edge does not exceed
+transaction costs.
+
+------------------------------------------------------------
+OUT-OF-SAMPLE PERFORMANCE -- NO-EDGE BASELINE (DIAGNOSTIC ONLY)
+------------------------------------------------------------
+
+NOTE: the block below is NOT the strategy.  It is a transparent baseline that
+DROPS the EV>0 requirement and forces a trade on the single least-bad statistical
+state each bar (sample-count validity, costs, risk and execution all still apply).
+By construction those states have EV ~ -cost, so it is EXPECTED TO LOSE.  It is
+shown to report the loss honestly and to populate the required OOS diagnostics --
+never as a tradeable result.
+
+Initial Capital:     $10,000.00
+Final Capital:       $73.46
+Net P&L:             $-9,926.54
+Total Return:        -99.27%
+CAGR:                -99.27%
+
+Total Trades:        4,586
+Trades/Year:         4,589
+Trades/Month:        382.4
+Trades/Day:          12.56
+
+Win Rate:            37.64%
+Profit Factor:       0.49
+Expectancy:          $-2.16/trade
+
+Sharpe:              -18.88
+Sortino:             -23.98
+Calmar:              -1.00
+
+Maximum Drawdown:    -99.29%
+Max DD Duration:     360.2 days
+
+Average Winner:      $5.60
+Average Loser:       $-6.85
+Largest Winner:      $58.84
+Largest Loser:       $-67.89
+
+Long Trades:         1,907
+Short Trades:        2,679
+
+Average Holding:     100 min
+Time in Market:      87.7%
+
+------------------------------------------------------------
+ROBUSTNESS
+------------------------------------------------------------
+
+Monte Carlo Simulations:      10,000
+Probability of Loss:          100.0%
+Median Simulated Final Equity:$73
+5th Percentile:               $48
+95th Percentile:              $113
+
+Walk-Forward (IS): 0/4 folds profitable, median Sharpe -1.58
+Robustness (IS):   0/9 parameter variants profitable
+
+------------------------------------------------------------
+VALIDATION
+------------------------------------------------------------
+
+Look-Ahead Bias:                 NONE DETECTED
+Machine Learning:                NOT USED
+Technical Indicators:            NOT USED
+OOS Data Used During Optimization: NO
+
+------------------------------------------------------------
+STATUS
+------------------------------------------------------------
+
+OOS TEST RESULT:     FAIL - no repeatable, cost-surviving edge (engine took 0 trades)
+Live Paper Testing:  NOT SUITABLE
+
+==============================================================================
+[  121.8s] DONE.

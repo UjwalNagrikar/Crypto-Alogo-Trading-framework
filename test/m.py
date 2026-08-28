@@ -550,3 +550,53 @@ plt.tight_layout()
 plt.savefig(OUTPUT_DIR / "max_drawdown.png", dpi=150, bbox_inches="tight")
 plt.show()
 plt.close()
+
+# OUT-OF-SAMPLE TRADES
+plt.figure(figsize=(15, 7))
+plt.plot(
+    out_of_sample_df[time_col],
+    out_of_sample_df["close"],
+    color="steelblue",
+    linewidth=1.0,
+    label="Out-of-sample close",
+)
+
+long_trades = trades_df[trades_df["side"] == "LONG"]
+short_trades = trades_df[trades_df["side"] == "SHORT"]
+
+plt.scatter(
+    long_trades["entry_time"],
+    long_trades["entry"],
+    marker="^",
+    color="green",
+    s=45,
+    label="Long entry",
+    zorder=3,
+)
+plt.scatter(
+    short_trades["entry_time"],
+    short_trades["entry"],
+    marker="v",
+    color="darkorange",
+    s=45,
+    label="Short entry",
+    zorder=3,
+)
+plt.scatter(
+    trades_df["exit_time"],
+    trades_df["exit"],
+    marker="x",
+    color="red",
+    s=45,
+    label="Exit",
+    zorder=3,
+)
+plt.title("Out-of-Sample Trades")
+plt.xlabel("Date")
+plt.ylabel("Price")
+plt.grid(alpha=0.25)
+plt.legend()
+plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "out_of_sample_trades.png", dpi=150, bbox_inches="tight")
+plt.show()
+plt.close()

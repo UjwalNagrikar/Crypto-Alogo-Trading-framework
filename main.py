@@ -1,10 +1,12 @@
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+from pathlib import Path
 
 # CONFIG
 CSV_FILE = "/content/btcusd_5m_full.csv"
 INITIAL_CAPITAL = 10_000.0
+OUTPUT_DIR = Path.cwd()
 
 # Regime / structure
 REGIME_LOOKBACK = 40
@@ -453,7 +455,9 @@ def plot_monte_carlo(trades_data, initial_capital, simulations=5000, seed=42):
     plt.grid(alpha=0.25)
     plt.legend()
     plt.tight_layout()
+    plt.savefig(OUTPUT_DIR / "monte_carlo_simulation.png", dpi=150, bbox_inches="tight")
     plt.show()
+    plt.close()
 
 # PRINT REPORT
 print()
@@ -502,7 +506,9 @@ plt.xlabel("Date")
 plt.ylabel("Equity ($)")
 plt.grid(alpha=0.25)
 plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "equity_curve.png", dpi=150, bbox_inches="tight")
 plt.show()
+plt.close()
 
 # MONTE CARLO SIMULATION
 plot_monte_carlo(trades_df, INITIAL_CAPITAL)
@@ -522,4 +528,6 @@ plt.xlabel("Date")
 plt.ylabel("Drawdown (%)")
 plt.grid(alpha=0.25)
 plt.tight_layout()
+plt.savefig(OUTPUT_DIR / "max_drawdown.png", dpi=150, bbox_inches="tight")
 plt.show()
+plt.close()

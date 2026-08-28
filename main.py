@@ -11,18 +11,12 @@ REGIME_LOOKBACK = 40
 BREAKOUT_LOOKBACK = 20
 RANGE_LOOKBACK = 20
 
-# Mean reversion
-MR_ENTRY_PERCENTILE = 0.10
-MR_TARGET_PERCENTILE = 0.50
-
 # Risk
 RISK_PER_TRADE = 0.005  # 0.5%
 MAX_POSITION_NOTIONAL = 1.0  # max 1x equity
 
 # Reward / stop
 MOMENTUM_RR = 2.0
-MR_RR = 1.5
-
 # Execution costs
 FEE = 0.0005  # 0.05%
 SLIPPAGE = 0.0002  # 0.02%
@@ -144,18 +138,15 @@ for i in range(REGIME_LOOKBACK + 2, len(df)):
 
     equity_before = cash
 
-    # ========================================================
+    
     # MANAGE POSITION
-    # ========================================================
     if position is not None:
         position["bars"] += 1
         exit_price = None
         exit_reason = None
         side = position["side"]
 
-        # ----------------------------------------------------
         # LONG
-        # ----------------------------------------------------
         if side == "LONG":
             stop = position["stop"]
             target = position["target"]
@@ -166,10 +157,8 @@ for i in range(REGIME_LOOKBACK + 2, len(df)):
             elif high >= target:
                 exit_price = apply_exit_slippage(target, side)
                 exit_reason = "TARGET"
-
-        # ----------------------------------------------------
+        
         # SHORT
-        # ----------------------------------------------------
         else:
             stop = position["stop"]
             target = position["target"]
@@ -181,16 +170,12 @@ for i in range(REGIME_LOOKBACK + 2, len(df)):
                 exit_price = apply_exit_slippage(target, side)
                 exit_reason = "TARGET"
 
-        # ----------------------------------------------------
         # TIME EXIT
-        # ----------------------------------------------------
         if exit_price is None and position["bars"] >= MAX_HOLD_BARS:
             exit_price = apply_exit_slippage(close, side)
             exit_reason = "TIME_EXIT"
 
-        # ----------------------------------------------------
         # EXIT
-        # ----------------------------------------------------
         if exit_price is not None:
             entry = position["entry"]
             qty = position["qty"]
@@ -250,9 +235,7 @@ for i in range(REGIME_LOOKBACK + 2, len(df)):
         ):
             regime = "UNKNOWN"
         else:
-            # ------------------------------------------------
             # TREND / MOMENTUM REGIME
-            # ------------------------------------------------
             strong_direction = direction_ratio >= MAX_RANGE_TREND_RATIO
 
             # Price is moving meaningfully through its recent range.
@@ -261,9 +244,7 @@ for i in range(REGIME_LOOKBACK + 2, len(df)):
                     regime = "BULL_TREND"
                 else:
                     regime = "BEAR_TREND"
-            # ------------------------------------------------
             # RANGE REGIME
-            # ------------------------------------------------
             else:
                 regime = "RANGE"
 
@@ -336,85 +317,6 @@ for i in range(REGIME_LOOKBACK + 2, len(df)):
                             "bars": 0,
                         }
 
-        # MEAN REVERSION LONG
-        elif regime == "RANGE":
-            # Near bottom of range
-            near_bottom = range_position <= MR_ENTRY_PERCENTILE
-
-            # Reversal candle: close > open
-            bullish_reversal = close > open_price
-
-            # Previous candle should have been weaker/down.
-            previous_close = df["close"].iloc[i - 1]
-            previous_open = df["open"].iloc[i - 1]
-            previous_bearish = previous_close < previous_open
-
-            if near_bottom and bullish_reversal and previous_bearish:
-                entry = open_price
-
-                # Stop just below recent structure
-                stop = float(df["low"].iloc[i - 5 : i].min())
-
-                # Midpoint target
-                target = regime_low + range_size * MR_TARGET_PERCENTILE
-
-                if stop < entry and target > entry:
-                    risk_distance = entry - stop
-
-                    # Avoid absurdly large stop
-                    if risk_distance <= range_size * 0.50:
-                        equity = cash
-                        qty, risk = calculate_quantity(equity, entry, stop)
-
-                        if qty > 0:
-                            entry = apply_entry_slippage(entry, "LONG")
-                            position = {
-                                "side": "LONG",
-                                "regime": "MEAN_REVERSION",
-                                "entry_time": current_time,
-                                "entry": entry,
-                                "stop": stop,
-                                "target": target,
-                                "qty": qty,
-                                "risk": risk,
-                                "bars": 0,
-                            }
-
-        # MEAN REVERSION SHORT
-        elif regime == "RANGE":
-            near_top = range_position >= (1 - MR_ENTRY_PERCENTILE)
-            bearish_reversal = close < open_price
-
-            previous_close = df["close"].iloc[i - 1]
-            previous_open = df["open"].iloc[i - 1]
-            previous_bullish = previous_close > previous_open
-
-            if near_top and bearish_reversal and previous_bullish:
-                entry = open_price
-                stop = float(df["high"].iloc[i - 5 : i].max())
-                target = regime_low + range_size * MR_TARGET_PERCENTILE
-
-                if stop > entry and target < entry:
-                    risk_distance = stop - entry
-
-                    if risk_distance <= range_size * 0.50:
-                        equity = cash
-                        qty, risk = calculate_quantity(equity, entry, stop)
-
-                        if qty > 0:
-                            entry = apply_entry_slippage(entry, "SHORT")
-                            position = {
-                                "side": "SHORT",
-                                "regime": "MEAN_REVERSION",
-                                "entry_time": current_time,
-                                "entry": entry,
-                                "stop": stop,
-                                "target": target,
-                                "qty": qty,
-                                "risk": risk,
-                                "bars": 0,
-                            }
-
     # MARK TO MARKET
     current_equity = cash
     if position is not None:
@@ -485,7 +387,6 @@ else:
 
 # REGIME PERFORMANCE
 momentum = trades_df[trades_df["regime"] == "MOMENTUM"]
-mean_reversion = trades_df[trades_df["regime"] == "MEAN_REVERSION"]
 
 
 def regime_stats(data):
@@ -499,12 +400,65 @@ def regime_stats(data):
 
 
 mom_stats = regime_stats(momentum)
-mr_stats = regime_stats(mean_reversion)
+
+
+def plot_monte_carlo(trades_data, initial_capital, simulations=5000, seed=42):
+    trade_pnl = trades_data["pnl"].to_numpy(dtype=float)
+    rng = np.random.default_rng(seed)
+    sampled_pnl = rng.choice(
+        trade_pnl,
+        size=(simulations, len(trade_pnl)),
+        replace=True,
+    )
+    simulated_equity = initial_capital + np.cumsum(sampled_pnl, axis=1)
+    simulated_equity = np.column_stack(
+        [np.full(simulations, initial_capital), simulated_equity]
+    )
+
+    percentile_5, percentile_50, percentile_95 = np.percentile(
+        simulated_equity,
+        [5, 50, 95],
+        axis=0,
+    )
+    trade_number = np.arange(simulated_equity.shape[1])
+
+    plt.figure(figsize=(15, 7))
+    for path in simulated_equity[:100]:
+        plt.plot(trade_number, path, color="steelblue", alpha=0.08, linewidth=0.8)
+    plt.fill_between(
+        trade_number,
+        percentile_5,
+        percentile_95,
+        color="cornflowerblue",
+        alpha=0.25,
+        label="5th-95th percentile",
+    )
+    plt.plot(
+        trade_number,
+        percentile_50,
+        color="navy",
+        linewidth=2,
+        label="Median simulated equity",
+    )
+    plt.axhline(
+        initial_capital,
+        color="black",
+        linestyle="--",
+        alpha=0.6,
+        label="Initial capital",
+    )
+    plt.title("Monte Carlo Trade-Sequence Simulation")
+    plt.xlabel("Completed trades")
+    plt.ylabel("Simulated equity ($)")
+    plt.grid(alpha=0.25)
+    plt.legend()
+    plt.tight_layout()
+    plt.show()
 
 # PRINT REPORT
 print()
 print("=" * 65)
-print("BTCUSD REGIME + MOMENTUM + MEAN REVERSION")
+print("BTCUSD REGIME + MOMENTUM")
 print("=" * 65)
 print(f"Initial Capital   : ${INITIAL_CAPITAL:,.2f}")
 print(f"Final Equity      : ${final_equity:,.2f}")
@@ -528,11 +482,6 @@ print("MOMENTUM")
 print(f"  Trades          : {mom_stats['trades']}")
 print(f"  P&L             : ${mom_stats['pnl']:,.2f}")
 print(f"  Win Rate        : {mom_stats['winrate']:.2f}%")
-print()
-print("MEAN REVERSION")
-print(f"  Trades          : {mr_stats['trades']}")
-print(f"  P&L             : ${mr_stats['pnl']:,.2f}")
-print(f"  Win Rate        : {mr_stats['winrate']:.2f}%")
 print("=" * 65)
 
 # SAVE RESULTS
@@ -554,6 +503,9 @@ plt.ylabel("Equity ($)")
 plt.grid(alpha=0.25)
 plt.tight_layout()
 plt.show()
+
+# MONTE CARLO SIMULATION
+plot_monte_carlo(trades_df, INITIAL_CAPITAL)
 
 # DRAWDOWN
 plt.figure(figsize=(15, 5))
